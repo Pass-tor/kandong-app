@@ -1,9 +1,10 @@
-/* js/app.js – Kandong v1.2 vanilla PWA */
+/* js/app.js – Kandong v1.2.1 vanilla PWA */
 (function () {
   'use strict';
 
   const cfg = window.KANDONG_CONFIG;
   const $ = (sel, el = document) => el.querySelector(sel);
+  const PLACES = cfg.PLACES || [];
 
   const state = {
     mode: 'passenger',
@@ -29,10 +30,15 @@
     liveBookings: [],
     bookingBusy: false,
     deferredPrompt: null,
+    locLoading: false,
+    coords: null,
+    suggestField: null, // 'pickup' | 'drop' | null
+    suggestions: [],
   };
 
   let pollTimer = null;
   let progressTimer = null;
+  let suggestTimer = null;
 
   function toast(msg, ms = 3200) {
     state.toast = msg;
@@ -55,6 +61,97 @@
   function hasKey() {
     const k = localStorage.getItem('kandong_anon_key') || cfg.SUPABASE_ANON_KEY;
     return k && k !== 'PASTE_YOUR_ANON_KEY_HERE' && k.length > 20;
+  }
+
+  function filterPlaces(query) {
+    const q = (query || '').trim().toLowerCase();
+    if (q.length < 1) return PLACES.slice(0, 8);
+    const scored = PLACES.map((p) => {
+      const name = p.name.toLowerCase();
+      const area = (p.area || '').toLowerCase();
+      let score = 0;
+      if (name.startsWith(q)) score += 100;
+      else if (name.includes(q)) score += 50;
+      if (area.includes(q)) score += 30;
+      return { ...p, score };
+    })
+      .filter((p) => p.score > 0)
+      .sort((a, b) => b.score - a.score);
+    return scored.slice(0, 8);
+  }
+
+  function openSuggest(field, value) {
+    state.suggestField = field;
+    state.suggestions = filterPlaces(value);
+    render();
+  }
+
+  function pickSuggestion(place) {
+    const label = place.area ? `${place.name}, ${place.area}` : place.name;
+    if (state.suggestField === 'pickup') state.pickup = label;
+    else if (state.suggestField === 'drop') state.drop = label;
+    state.suggestField = null;
+    state.suggestions = [];
+    render();
+  }
+
+  function closeSuggest() {
+    state.suggestField = null;
+    state.suggestions = [];
+  }
+
+  async function useCurrentLocation() {
+    if (!navigator.geolocation) {
+      toast('Geolocation hindi supported sa device mo');
+      return;
+    }
+    state.locLoading = true;
+    render();
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        state.coords = { lat: latitude, lng: longitude };
+        let label = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+        try {
+          const res = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=16&addressdetails=1`,
+            { headers: { Accept: 'application/json' } }
+          );
+          if (res.ok) {
+            const data = await res.json();
+            const a = data.address || {};
+            const parts = [
+              a.road || a.pedestrian || a.neighbourhood,
+              a.suburb || a.village || a.town || a.city_district,
+              a.city || a.municipality || a.county,
+            ].filter(Boolean);
+            if (parts.length) label = parts.slice(0, 2).join(', ');
+            else if (data.display_name) {
+              label = data.display_name.split(',').slice(0, 2).join(',').trim();
+            }
+          }
+        } catch (_) {
+          /* keep coords as label */
+        }
+        state.pickup = label;
+        state.locLoading = false;
+        closeSuggest();
+        toast('📍 Current location set as pickup');
+        render();
+      },
+      (err) => {
+        state.locLoading = false;
+        const msg =
+          err.code === 1
+            ? 'Payagan ang location access sa browser'
+            : err.code === 2
+              ? 'Hindi makuha ang GPS signal'
+              : 'Timeout – subukan ulit';
+        toast(msg);
+        render();
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 }
+    );
   }
 
   async function connect() {
@@ -240,6 +337,7 @@
 
   function setMode(m) {
     state.mode = m;
+    closeSuggest();
     toast(m === 'passenger' ? 'PASAHERO mode' : 'RIDER mode');
     if (m === 'rider' && state.online) fetchLiveBookings();
     render();
@@ -337,6 +435,22 @@ alter publication supabase_realtime add table public.bookings;`;
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
+  }
+
+  function suggestDropdown(field) {
+    if (state.suggestField !== field || !state.suggestions.length) return '';
+    return `
+    <div class="suggest-box" role="listbox">
+      ${state.suggestions
+        .map(
+          (p, i) => `
+        <button type="button" class="suggest-item" data-suggest-idx="${i}" role="option">
+          <span class="suggest-name">${esc(p.name)}</span>
+          <span class="suggest-area">${esc(p.area || '')}</span>
+        </button>`
+        )
+        .join('')}
+    </div>`;
   }
 
   function render() {
@@ -437,7 +551,7 @@ alter publication supabase_realtime add table public.bookings;`;
           <div class="ping"></div>
           <div class="map-pin">📍</div>
         </div>
-        <div class="map-label">IKAW DITO</div>
+        <div class="map-label">${state.coords ? 'GPS ACTIVE' : 'IKAW DITO'}</div>
       </div>
       ${
         state.status !== 'idle'
@@ -448,8 +562,10 @@ alter publication supabase_realtime add table public.bookings;`;
           : ''
       }
       <div class="map-controls">
+        <button class="map-btn" data-action="use-location" title="Current location" ${state.locLoading ? 'disabled' : ''}>
+          ${state.locLoading ? '⏳' : '📍'}
+        </button>
         <button class="map-btn" data-action="center">🎯</button>
-        <button class="map-btn" data-action="nav">🧭</button>
       </div>
       ${
         state.status === 'ontheway'
@@ -483,24 +599,30 @@ alter publication supabase_realtime add table public.bookings;`;
             <label>PANGALAN MO</label>
             <div class="input-wrap">
               <span>👤</span>
-              <input id="name-input" value="${esc(state.name)}" placeholder="Pangalan">
+              <input id="name-input" value="${esc(state.name)}" placeholder="Pangalan" autocomplete="name">
             </div>
           </div>
-          <div class="field">
-            <label>SAAN KA?</label>
+          <div class="field field-suggest">
+            <div class="field-label-row">
+              <label>SAAN KA? (PICKUP)</label>
+              <button type="button" class="loc-btn" data-action="use-location" ${state.locLoading ? 'disabled' : ''}>
+                ${state.locLoading ? '…' : '📍 Current location'}
+              </button>
+            </div>
             <div class="input-wrap">
               <span>📍</span>
-              <input id="pickup-input" list="spots" value="${esc(state.pickup)}" placeholder="Saan ka? (Pickup)">
+              <input id="pickup-input" value="${esc(state.pickup)}" placeholder="Type or use current location" autocomplete="off">
             </div>
+            ${suggestDropdown('pickup')}
           </div>
-          <div class="field">
-            <label>SAAN PUNTA?</label>
+          <div class="field field-suggest">
+            <label>SAAN PUNTA? (DROP)</label>
             <div class="input-wrap">
               <span>🧭</span>
-              <input id="drop-input" list="spots" value="${esc(state.drop)}" placeholder="Saan punta? (Drop)">
+              <input id="drop-input" value="${esc(state.drop)}" placeholder="Mag-type para may suggestions…" autocomplete="off">
             </div>
+            ${suggestDropdown('drop')}
           </div>
-          <datalist id="spots">${cfg.SPOTS.map((s) => `<option value="${esc(s)}">`).join('')}</datalist>
         </div>
       </div>
 
@@ -539,7 +661,7 @@ alter publication supabase_realtime add table public.bookings;`;
       }
     </div>
 
-    <div class="px-5 mt-6" style="padding-bottom:20px">
+    <div class="px-5 mt-6" style="padding-bottom:8px">
       ${
         state.status === 'idle'
           ? `
@@ -661,7 +783,7 @@ alter publication supabase_realtime add table public.bookings;`;
       </div>
     </div>
 
-    <div class="px-5 mt-5" style="padding-bottom:20px">
+    <div class="px-5 mt-5" style="padding-bottom:8px">
       ${
         !state.online
           ? `
@@ -721,36 +843,7 @@ alter publication supabase_realtime add table public.bookings;`;
 
   function renderCreator() {
     return `
-    <div class="creator">
-      <div class="creator-glow top"></div>
-      <div class="creator-glow bot"></div>
-      <div style="position:relative">
-        <div class="flex items-start gap-3">
-          <div style="width:48px;height:48px;border-radius:9999px;background:var(--green);display:flex;align-items:center;justify-content:center;color:#000;font-weight:900;font-size:16px;border:2px solid #000;box-shadow:0 0 16px rgba(0,200,83,0.4)">EP</div>
-          <div style="flex:1">
-            <div class="flex items-center gap-2" style="flex-wrap:wrap">
-              <h3 class="font-black" style="font-size:15px">Edwin Macatangay Perez</h3>
-              <span class="badge" style="background:var(--green);color:#000">CREATOR</span>
-            </div>
-            <div class="flex items-center gap-2 mt-1">
-              <a href="https://instagram.com/chib_e" target="_blank" rel="noopener" class="text-green font-bold text-sm">@chib_e</a>
-              <span class="text-muted text-xs">• Developer & Designer</span>
-            </div>
-          </div>
-        </div>
-        <div class="mt-4" style="background:rgba(0,200,83,0.1);border:1px solid rgba(0,200,83,0.2);border-radius:12px;padding:10px 12px;display:flex;align-items:center;justify-content:space-between">
-          <div class="flex items-center gap-2">
-            <div style="width:28px;height:28px;border-radius:9999px;background:var(--green);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:900;color:#000">K</div>
-            <div>
-              <p class="font-black text-xs">KANDONG</p>
-              <p class="text-green text-xs font-bold">v${cfg.VERSION} • Supabase Realtime • PWA</p>
-            </div>
-          </div>
-          <span class="text-xs text-muted font-bold" style="letter-spacing:0.1em">2026</span>
-        </div>
-        <p class="text-center text-xs text-muted mt-4">Built by Edwin Macatangay Perez @chib_e • v${cfg.VERSION}</p>
-      </div>
-    </div>`;
+    <p class="credit-line">Kandong v${cfg.VERSION} · E.M. Perez</p>`;
   }
 
   function renderSettings() {
@@ -814,25 +907,30 @@ alter publication supabase_realtime add table public.bookings;`;
           <button class="icon-btn" data-action="close-about">✕</button>
         </div>
         <div class="modal-body">
-          <div style="background:#0F0F0F;border:1px solid rgba(0,200,83,0.4);border-radius:20px;padding:16px">
-            <div class="flex items-center gap-3">
-              <div style="width:48px;height:48px;border-radius:9999px;background:var(--green);display:flex;align-items:center;justify-content:center;color:#000;font-weight:900;border:2px solid #000">EP</div>
-              <div>
-                <p class="font-black">Edwin Macatangay Perez</p>
-                <a href="https://instagram.com/chib_e" target="_blank" rel="noopener" class="text-green text-xs font-bold">@chib_e • Creator</a>
-              </div>
-            </div>
-          </div>
-          <div class="text-center text-xs text-muted pt-2">
-            © 2026 Edwin Macatangay Perez • Kandong v${cfg.VERSION}<br>
-            Built with ❤️ • Supabase Realtime • Installable PWA
-          </div>
+          <p class="text-sm text-muted" style="line-height:1.5">
+            Habal booking app with live Supabase bookings, installable PWA, current location, and place suggestions.
+          </p>
+          <p class="text-xs text-muted text-center" style="opacity:0.5">v${cfg.VERSION} · E.M. Perez</p>
         </div>
       </div>
     </div>`;
   }
 
   document.addEventListener('click', (e) => {
+    const suggestBtn = e.target.closest('[data-suggest-idx]');
+    if (suggestBtn) {
+      const idx = parseInt(suggestBtn.dataset.suggestIdx, 10);
+      if (state.suggestions[idx]) pickSuggestion(state.suggestions[idx]);
+      return;
+    }
+
+    if (!e.target.closest('.field-suggest') && !e.target.closest('[data-action="use-location"]')) {
+      if (state.suggestField) {
+        closeSuggest();
+        render();
+      }
+    }
+
     const t = e.target.closest(
       '[data-action], [data-nav], [data-accept], [data-ontheway], [data-arrived]'
     );
@@ -865,9 +963,11 @@ alter publication supabase_realtime add table public.bookings;`;
     else if (t.dataset.action === 'save-key') saveKey();
     else if (t.dataset.action === 'clear-key') clearKey();
     else if (t.dataset.action === 'copy-sql') copySQL();
-    else if (t.dataset.action === 'center') toast('📍 Location centered');
-    else if (t.dataset.action === 'nav') toast('🧭 Navigation ready');
-    else if (t.dataset.nav) {
+    else if (t.dataset.action === 'use-location') useCurrentLocation();
+    else if (t.dataset.action === 'center') {
+      if (state.coords) toast('🎯 Centered on GPS');
+      else useCurrentLocation();
+    } else if (t.dataset.nav) {
       state.nav = t.dataset.nav;
       toast(t.dataset.nav === 'Home' ? 'Home • Kandong' : `${t.dataset.nav} • Coming soon`);
       render();
@@ -884,14 +984,27 @@ alter publication supabase_realtime add table public.bookings;`;
   });
 
   document.addEventListener('input', (e) => {
-    if (e.target.id === 'name-input') state.name = e.target.value;
-    else if (e.target.id === 'pickup-input') {
-      state.pickup = e.target.value;
-      render();
-    } else if (e.target.id === 'drop-input') {
-      state.drop = e.target.value;
-      render();
+    if (e.target.id === 'name-input') {
+      state.name = e.target.value;
+      return;
     }
+    if (e.target.id === 'pickup-input') {
+      state.pickup = e.target.value;
+      clearTimeout(suggestTimer);
+      suggestTimer = setTimeout(() => openSuggest('pickup', state.pickup), 120);
+      return;
+    }
+    if (e.target.id === 'drop-input') {
+      state.drop = e.target.value;
+      clearTimeout(suggestTimer);
+      suggestTimer = setTimeout(() => openSuggest('drop', state.drop), 120);
+      return;
+    }
+  });
+
+  document.addEventListener('focusin', (e) => {
+    if (e.target.id === 'pickup-input') openSuggest('pickup', state.pickup);
+    if (e.target.id === 'drop-input') openSuggest('drop', state.drop);
   });
 
   function init() {
